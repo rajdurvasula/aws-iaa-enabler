@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates State Machine and Lambda functions to enable IAA in enrolled accounts
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: AWS Organizations ID for the Control Tower.
+    Default: 'o-a4tlobvmc0'
+    AllowedPattern: '^[o][\-][a-z0-9]{10}$'
+    ConstraintDescription: The Org Id must be a 12 character string starting with o- and followed by 10 lower case alphanumeric characters
+    MinLength: 12
+    MaxLength: 12
+  SecurityAccountId:
+    Type: String
+    Description: Which account will be GuardyDuty Admin account? Enter AWS Account ID.
+    Default: 413157014023
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: The Security Account ID must be a 12 character string.
+    MinLength: 12
+    MaxLength: 12
+  S3SourceBucket:
+    Type: String
+    Description: S3 bucket containing GuardDutyAdminEnabler Lambda package
+    Default: 'org-sh-ops'
+  S3SourceKey1:
+    Type: String
+    Description: S3 object key for GuardDuty on Master Account Lambda package
+    Default: 'enable_iaa_member.zip'
+  S3SourceKey2:
+    Type: String
+    Description: S3 object key for OU Accounts Lambda package
+    Default: 'ou_member_accounts.zip'
+  S3SourceKey3:
+    Type: String
+    Description: S3 object key for IAAEnabler StateMachine
+    Default: 'iaa_member_enabler_sm.json'
+  RoleToAssume:
+    Type: String
+    Description: IAM role to be assumed in child accounts to enable GuardDuty. Default is AWSControlTowerExecution for a Control Tower environment.
+    Default: AWSControlTowerExecution
+Resources:
+  IAAEnablerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCloudFormationFullAccess'
+        - 'arn:aws:iam::aws:policy/IAMAccessAnalyzerFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/service-role/AWSControlTowerServiceRolePolicy'
+      Policies:
+        - PolicyName: IAAEnablerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'organizations:ListAccounts'
+                  - 'organizations:DescribeAccount'
+                  - 'organizations:ListParents'
+                  - 'organizations:EnableAWSServiceAccess'
+                  - 'organizations:RegisterDelegatedAdministrator'
+                  - 'organizations:ListDelegatedAdministrators'
+                  - 'organizations:ListAWSServiceAccessForOrganization'
+                  - 'organizations:DescribeOrganization'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalOrgId': !Ref OrganizationId
+              - Effect: Allow
+                Action:
+                  organizations:DescribeOrganizationalUnit
+                Resource: !Sub 'arn:aws:organizations::${AWS::AccountId}:ou/${OrganizationId}/ou-*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeRegions'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:CreateServiceLinkedRole'
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'iam:AWSServiceName': 'guardduty.amazonaws.com'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::*:role/${RoleToAssume}'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalOrgId': !Ref OrganizationId
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::*:role/${RoleToAssume}'              
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:log-stream:*'
+  EnableIAAMemberLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - IAAEnablerRole
+    Properties:
+      FunctionName: IAAEnablerMember
+      Handler: 'enable_iaa_member.lambda_handler'
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${IAAEnablerRole}'
+      Code:
+        S3Bucket: !Ref S3SourceBucket
+        S3Key: !Ref S3SourceKey1
+      Runtime: python3.8
+      MemorySize: 256
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          log_level: INFO
+  GetOUMemberAccountsLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - IAAEnablerRole
+    Properties:
+      FunctionName: GetOUMemberAccounts
+      Handler: 'ou_member_accounts.lambda_handler'
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${IAAEnablerRole}'
+      Code:
+        S3Bucket: !Ref S3SourceBucket
+        S3Key: !Ref S3SourceKey2
+      Runtime: python3.8
+      MemorySize: 256
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          log_level: INFO
+  IAAEnablerSMExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - 'states.amazonaws.com'
+              Action:
+                - 'sts:AssumeRole'
+        Path: '/'
+        Policies:
+          - PolicyName: IAAEnablerSMPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 'lambda:InvokeFunction'
+                  Resource:
+                    - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:IAAEnablerMember:*'
+                    - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:GetOUMemberAccounts:*'
+                - Effect: Allow
+                  Action:
+                    - 'lambda:InvokeFunction'
+                  Resource:
+                    - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:IAAEnablerMember:*'
+                    - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:GetOUMemberAccounts:*'
+  IAAEnablerSM:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - EnableIAAMemberLambda
+      - GetOUMemberAccountsLambda
+      - IAAEnablerSMExecRole
+    Properties:
+      StateMachineType: 'STANDARD'
+      DefinitionS3Location:
+        Bucket: !Ref S3SourceBucket
+        Key: !Ref S3SourceKey3
+      RoleArn: !GetAtt IAAEnablerSMExecRole.Arn
